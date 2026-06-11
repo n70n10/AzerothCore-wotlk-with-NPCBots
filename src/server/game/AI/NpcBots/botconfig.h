@@ -37,6 +37,7 @@ public:
     static void ReloadConfig();
 
     static bool IsNpcBotModEnabled();
+    static bool IsNpcBotPlayerHireEnabled();
     static bool IsNpcBotLogEnabled();
     static bool IsNpcBotDungeonFinderEnabled();
     static bool IsNpcBotDungeonFinderBotGenerationEnabled();

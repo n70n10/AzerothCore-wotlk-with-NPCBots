@@ -1,4 +1,5 @@
 #include "bot_ai.h"
+#include "botconfig.h"
 #include "botdatamgr.h"
 #include "botdump.h"
 #include "botgearscore.h"
@@ -687,8 +688,10 @@ public:
             { "item",       HandleNpcBotUseOnBotItemCommand,        rbac::RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC,       Console::No  },
         };
 
-        static ChatCommandTable npcbotCommandTable =
+        static ChatCommandTable npcbotCommandTable = []() -> ChatCommandTable
         {
+            ChatCommandTable npcbotCommands =
+            {
             //{ "debug",      npcbotDebugCommandTable                                                                                 },
             //{ "toggle",     npcbotToggleCommandTable                                                                                },
             { "set",        npcbotSetCommandTable                                                                                   },
@@ -721,7 +724,19 @@ public:
             { "dump",       npcbotDumpCommandTable                                                                                  },
             { "wp",         npcbotWPCommandTable                                                                                    },
             { "log",        npcbotLogCommandTable                                                                                   },
-        };
+            };
+
+            // Player hire/fire commands are only registered (and thus only
+            // listed and reachable) when NpcBot.EnablePlayerHire = 1.
+            if (BotCfg::IsNpcBotPlayerHireEnabled())
+            {
+                npcbotCommands.push_back({ "hire",      HandleNpcBotHireCommand,      rbac::RBAC_PERM_COMMAND_NPCBOT_HIRE,      Console::No });
+                npcbotCommands.push_back({ "hireclass", HandleNpcBotHireClassCommand, rbac::RBAC_PERM_COMMAND_NPCBOT_HIRECLASS, Console::No });
+                npcbotCommands.push_back({ "fire",      HandleNpcBotFireCommand,      rbac::RBAC_PERM_COMMAND_NPCBOT_FIRE,      Console::No });
+            }
+
+            return npcbotCommands;
+        }();
 
         static ChatCommandTable commandTable =
         {
@@ -4946,6 +4961,447 @@ public:
         handler->SendSysMessage("You must select player or npcbot");
         handler->SetSentErrorMessage(true);
         return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Player hire/fire commands
+    // Enabled via NpcBot.EnablePlayerHire = 1 in worldserver.conf.
+    // Disabled by default; intended to be submitted as an upstream-compatible
+    // opt-in feature.  Grant RBAC_PERM_COMMAND_NPCBOT_HIRE (70038),
+    // RBAC_PERM_COMMAND_NPCBOT_HIRECLASS (70039), and
+    // RBAC_PERM_COMMAND_NPCBOT_FIRE (70040) to player accounts to enable.
+    // -----------------------------------------------------------------------
+
+    // Helper: spawn a free, never-previously-spawned npcbot at the player's
+    // location using the exact same flow as HandleNpcBotSpawnCommand.
+    // Returns the live Creature* on success, nullptr on failure.
+    // Assumes entry has no characters_npcbot record yet (caller must verify).
+    static Creature* _SpawnFreshBot(ChatHandler* handler, Player* player, uint32 id)
+    {
+        CreatureTemplate const* creInfo = sObjectMgr->GetCreatureTemplate(id);
+        if (!creInfo || !creInfo->IsNPCBot())
+            return nullptr;
+
+        Map* map = player->GetMap();
+        if (map->Instanceable())
+        {
+            handler->SendSysMessage("Cannot spawn bots inside instances.");
+            handler->SetSentErrorMessage(true);
+            return nullptr;
+        }
+
+        if (player->GetTransport())
+        {
+            handler->SendSysMessage("Cannot spawn bots on transport.");
+            handler->SetSentErrorMessage(true);
+            return nullptr;
+        }
+
+        NpcBotExtras const* extras = BotDataMgr::SelectNpcBotExtras(id);
+        if (!extras)
+        {
+            handler->PSendSysMessage("No class/race data found for bot entry {}.", id);
+            handler->SetSentErrorMessage(true);
+            return nullptr;
+        }
+
+        Creature* creature = new Creature();
+        if (!creature->Create(map->GenerateLowGuid<HighGuid::Unit>(), map,
+                player->GetPhaseMaskForSpawn(), id, 0,
+                player->GetPositionX(), player->GetPositionY(),
+                player->GetPositionZ(), player->GetOrientation()))
+        {
+            delete creature;
+            handler->SendSysMessage("Failed to create bot creature.");
+            handler->SetSentErrorMessage(true);
+            return nullptr;
+        }
+
+        uint8 spec   = BotDataMgr::SelectSpecForClass(extras->bclass);
+        uint32 roles = BotDataMgr::DefaultRolesForClass(extras->bclass, spec);
+        BotDataMgr::AddNpcBotData(id, roles, spec, creature->GetCreatureTemplate()->faction);
+
+        creature->SaveToDB(map->GetId(),
+            uint8(1) << map->GetSpawnMode(),
+            player->GetPhaseMaskForSpawn());
+
+        uint32 db_guid = creature->GetSpawnId();
+        if (!creature->LoadBotCreatureFromDB(db_guid, map))
+        {
+            delete creature;
+            handler->SendSysMessage("Failed to load bot from DB after saving.");
+            handler->SetSentErrorMessage(true);
+            return nullptr;
+        }
+
+        sObjectMgr->AddCreatureToGrid(db_guid, sObjectMgr->GetCreatureData(db_guid));
+        return creature;
+    }
+
+    // Helper: hire logic shared by hire and hireclass.
+    // Mirrors HandleNpcBotAddCommand exactly.
+    static bool _HireBot(ChatHandler* handler, Player* owner, Creature* bot)
+    {
+        ObjectGuid::LowType guidlow = owner->GetGUID().GetCounter();
+        BotDataMgr::UpdateNpcBotData(bot->GetEntry(), NPCBOT_UPDATE_OWNER, &guidlow);
+        NpcBotData::SharedOwnersContainer sharedOwners{};
+        BotDataMgr::UpdateNpcBotData(bot->GetEntry(), NPCBOT_UPDATE_SHARED_OWNERS, &sharedOwners);
+
+        if (owner->GetBotMgr()->AddBot(bot) == BOT_ADD_SUCCESS)
+        {
+            handler->PSendSysMessage("{} is now your npcbot.", bot->GetName());
+            return true;
+        }
+
+        // Roll back owner on failure
+        uint32 noOwner = 0;
+        BotDataMgr::UpdateNpcBotData(bot->GetEntry(), NPCBOT_UPDATE_OWNER, &noOwner);
+        handler->SendSysMessage("Failed to hire npcbot.");
+        handler->SetSentErrorMessage(true);
+        return false;
+    }
+
+    // Helper: string -> class ID, case-insensitive.
+    // Uses a manual lowercase compare to avoid extra STL header dependencies.
+    static uint8 _ClassStrToId(std::string const& name)
+    {
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name)
+            lower.push_back((c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c);
+
+        if (lower == "warrior")                          return CLASS_WARRIOR;
+        if (lower == "paladin")                          return CLASS_PALADIN;
+        if (lower == "hunter")                           return CLASS_HUNTER;
+        if (lower == "rogue")                            return CLASS_ROGUE;
+        if (lower == "priest")                           return CLASS_PRIEST;
+        if (lower == "deathknight" || lower == "dk")     return CLASS_DEATH_KNIGHT;
+        if (lower == "shaman")                           return CLASS_SHAMAN;
+        if (lower == "mage")                             return CLASS_MAGE;
+        if (lower == "warlock")                          return CLASS_WARLOCK;
+        if (lower == "druid")                            return CLASS_DRUID;
+        return 0;
+    }
+
+    // Helper: string -> race ID, case-insensitive. Returns 0 if unknown.
+    static uint8 _RaceStrToId(std::string const& name)
+    {
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name)
+            lower.push_back((c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c);
+
+        if (lower == "human")                            return RACE_HUMAN;
+        if (lower == "orc")                              return RACE_ORC;
+        if (lower == "dwarf")                            return RACE_DWARF;
+        if (lower == "nightelf" || lower == "nelf")      return RACE_NIGHTELF;
+        if (lower == "undead" || lower == "forsaken")    return RACE_UNDEAD_PLAYER;
+        if (lower == "tauren")                           return RACE_TAUREN;
+        if (lower == "gnome")                            return RACE_GNOME;
+        if (lower == "troll")                            return RACE_TROLL;
+        if (lower == "bloodelf" || lower == "belf")      return RACE_BLOODELF;
+        if (lower == "draenei")                          return RACE_DRAENEI;
+        return 0;
+    }
+
+    // Helper: returns true if a bot of the given race may be hired by the player,
+    // i.e. the bot's race shares the player's faction. Keeps Alliance characters
+    // from hiring Horde-race bots and vice-versa (immersion).
+    static bool _RaceMatchesPlayerFaction(Player const* player, uint8 botRace)
+    {
+        return Player::TeamIdForRace(botRace) == player->GetTeamId();
+    }
+
+    // .npcbot hire <name>
+    // Hires a free npcbot by name. Spawns it at the player's location if not
+    // yet in the world. Config: NpcBot.EnablePlayerHire = 1.
+    static bool HandleNpcBotHireCommand(ChatHandler* handler, Optional<std::string> nameVal)
+    {
+        if (!BotCfg::IsNpcBotPlayerHireEnabled())
+        {
+            handler->SendSysMessage("Player bot hire is not enabled on this server.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (!nameVal || nameVal->empty())
+        {
+            handler->SendSysMessage(".npcbot hire #name");
+            handler->SendSysMessage("Hires a free npcbot by name. Spawns it if not yet in world.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        Player* player = handler->GetSession()->GetPlayer();
+        std::string const& botName = *nameVal;
+
+        // Pass 1: find a free spawned bot by name
+        Creature* bot = nullptr;
+        {
+            std::shared_lock lock(*BotDataMgr::GetLock());
+            for (Creature const* cbot : BotDataMgr::GetExistingNPCBots())
+            {
+                if (cbot->GetBotAI()->GetBotOwnerGuid() || cbot->GetBotAI()->IsWanderer() || cbot->IsSummon())
+                    continue;
+                if (cbot->GetName() == botName)
+                {
+                    bot = const_cast<Creature*>(cbot);
+                    break;
+                }
+            }
+        }
+
+        if (bot)
+        {
+            NpcBotExtras const* ex = BotDataMgr::SelectNpcBotExtras(bot->GetEntry());
+            if (ex && !_RaceMatchesPlayerFaction(player, ex->race))
+            {
+                handler->PSendSysMessage("'{}' belongs to the opposing faction and cannot be hired.", botName);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            return _HireBot(handler, player, bot);
+        }
+
+        // Pass 2: look for a never-spawned bot by name in creature_template_npcbot_extras
+        uint32 entry = 0;
+        QueryResult result = WorldDatabase.Query(
+            "SELECT entry FROM creature_template_npcbot_extras");
+        if (result)
+        {
+            do
+            {
+                uint32 e = result->Fetch()[0].Get<uint32>();
+                if (BotDataMgr::SelectNpcBotData(e))
+                    continue;   // has a characters_npcbot record — handled in pass 1
+                CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(e);
+                if (ct && ct->Name == botName)
+                {
+                    entry = e;
+                    break;
+                }
+            } while (result->NextRow());
+        }
+
+        if (!entry)
+        {
+            handler->PSendSysMessage("No free npcbot named '{}' found.", botName);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        // Reject cross-faction hire by name.
+        if (NpcBotExtras const* ex = BotDataMgr::SelectNpcBotExtras(entry))
+        {
+            if (!_RaceMatchesPlayerFaction(player, ex->race))
+            {
+                handler->PSendSysMessage("'{}' belongs to the opposing faction and cannot be hired.", botName);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+        }
+
+        bot = _SpawnFreshBot(handler, player, entry);
+        if (!bot)
+            return false;
+
+        return _HireBot(handler, player, bot);
+    }
+
+    // .npcbot hireclass <class> [race]
+    // Hires a random free npcbot of the given class (and optional race),
+    // drawn from the combined pool of spawned-free bots and never-spawned
+    // bots. Spawns the chosen bot at the player's location if needed.
+    // Config: NpcBot.EnablePlayerHire = 1.
+    static bool HandleNpcBotHireClassCommand(ChatHandler* handler, Optional<std::string> classVal, Optional<std::string> raceVal)
+    {
+        if (!BotCfg::IsNpcBotPlayerHireEnabled())
+        {
+            handler->SendSysMessage("Player bot hire is not enabled on this server.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        if (!classVal || classVal->empty())
+        {
+            handler->SendSysMessage(".npcbot hireclass #class [#race]");
+            handler->SendSysMessage("Hires a random free npcbot of the given class (and optional race).");
+            handler->SendSysMessage("Classes: warrior paladin hunter rogue priest dk shaman mage warlock druid");
+            handler->SendSysMessage("Races: human orc dwarf nightelf undead tauren gnome troll bloodelf draenei");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        uint8 botClass = _ClassStrToId(*classVal);
+        if (!botClass)
+        {
+            handler->PSendSysMessage("Unknown class '{}'. Valid: warrior paladin hunter rogue priest dk shaman mage warlock druid", *classVal);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        uint8 botRace = 0;
+        if (raceVal && !raceVal->empty())
+        {
+            botRace = _RaceStrToId(*raceVal);
+            if (!botRace)
+            {
+                handler->PSendSysMessage("Unknown race '{}'. Valid: human orc dwarf nightelf undead tauren gnome troll bloodelf draenei", *raceVal);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+        }
+
+        Player* player = handler->GetSession()->GetPlayer();
+
+        // Build a combined candidate pool of bot entries matching class (+ race).
+        // Pass 1 (spawned-free) and pass 2 (never-spawned) are disjoint sets:
+        // pass 2 explicitly skips entries that already have a characters_npcbot
+        // record, so no de-duplication is required.
+        std::vector<uint32> candidates;
+
+        // Pass 1: spawned, free bots
+        {
+            std::shared_lock lock(*BotDataMgr::GetLock());
+            for (Creature const* cbot : BotDataMgr::GetExistingNPCBots())
+            {
+                if (cbot->GetBotAI()->GetBotOwnerGuid() || cbot->GetBotAI()->IsWanderer() || cbot->IsSummon())
+                    continue;
+                if (cbot->GetBotClass() != botClass)
+                    continue;
+                NpcBotExtras const* ex = BotDataMgr::SelectNpcBotExtras(cbot->GetEntry());
+                if (!ex)
+                    continue;
+                if (botRace && ex->race != botRace)
+                    continue;
+                if (!_RaceMatchesPlayerFaction(player, ex->race))
+                    continue;
+                candidates.push_back(cbot->GetEntry());
+            }
+        }
+
+        // Pass 2: never-spawned bots from creature_template_npcbot_extras
+        {
+            QueryResult result = botRace
+                ? WorldDatabase.Query("SELECT entry FROM creature_template_npcbot_extras WHERE class = {} AND race = {}", uint32(botClass), uint32(botRace))
+                : WorldDatabase.Query("SELECT entry FROM creature_template_npcbot_extras WHERE class = {}", uint32(botClass));
+            if (result)
+            {
+                do
+                {
+                    uint32 e = result->Fetch()[0].Get<uint32>();
+                    if (BotDataMgr::SelectNpcBotData(e))
+                        continue;   // already has a record — handled in pass 1
+                    NpcBotExtras const* ex = BotDataMgr::SelectNpcBotExtras(e);
+                    if (!ex || !_RaceMatchesPlayerFaction(player, ex->race))
+                        continue;
+                    candidates.push_back(e);
+                } while (result->NextRow());
+            }
+        }
+
+        if (candidates.empty())
+        {
+            if (botRace)
+                handler->PSendSysMessage("No free npcbot of class '{}' and race '{}' is available.", *classVal, *raceVal);
+            else
+                handler->PSendSysMessage("No free npcbot of class '{}' is available.", *classVal);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        // Pick a random candidate for variety.
+        uint32 entry = candidates[urand(0, candidates.size() - 1)];
+
+        // If the chosen entry is already spawned and free, hire it directly;
+        // otherwise spawn it fresh at the player's location.
+        Creature* bot = const_cast<Creature*>(BotDataMgr::FindBot(entry));
+        if (!bot)
+        {
+            bot = _SpawnFreshBot(handler, player, entry);
+            if (!bot)
+                return false;
+        }
+
+        return _HireBot(handler, player, bot);
+    }
+
+    // .npcbot fire [name]
+    // Dismisses a named npcbot from the player's roster and despawns it.
+    // If no name is given, dismisses the currently targeted owned npcbot.
+    // Config: NpcBot.EnablePlayerHire = 1.
+    static bool HandleNpcBotFireCommand(ChatHandler* handler, Optional<std::string> nameVal)
+    {
+        if (!BotCfg::IsNpcBotPlayerHireEnabled())
+        {
+            handler->SendSysMessage("Player bot hire is not enabled on this server.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        Player* owner = handler->GetSession()->GetPlayer();
+        if (!owner->HaveBot())
+        {
+            handler->SendSysMessage("You have no npcbots.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        Creature* bot = nullptr;
+
+        if (nameVal && !nameVal->empty())
+        {
+            // Fire by name
+            bot = owner->GetBotMgr()->GetBotByName(*nameVal);
+            if (!bot)
+            {
+                handler->PSendSysMessage("You do not have an npcbot named '{}'.", *nameVal);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+        }
+        else
+        {
+            // Fire targeted bot
+            Unit* target = owner->GetSelectedUnit();
+            Creature* cre = target ? target->ToCreature() : nullptr;
+            if (!cre || !cre->IsNPCBot() || cre->IsFreeBot())
+            {
+                handler->SendSysMessage(".npcbot fire [name]");
+                handler->SendSysMessage("Dismisses a named or targeted npcbot from your roster.");
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            if (cre->GetBotOwner() != owner)
+            {
+                handler->PSendSysMessage("{} does not belong to you.", cre->GetName());
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
+            bot = cre;
+        }
+
+        std::string name = bot->GetName();
+
+        // Free the bot first: returns its gear to the owner and removes it from
+        // the owner's roster (the "free" half of .npcbot delete).
+        if (!HandeNpcBotCleanUpAndRemoval(handler, bot, owner))
+        {
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        // Then fully delete it from world, DB and memory (same as .npcbot delete).
+        bot->CombatStop();
+        bot->GetBotAI()->Reset();
+        bot->GetBotAI()->canUpdate = false;
+        bot->DeleteFromDB();
+        bot->AddObjectToRemoveList();
+
+        BotDataMgr::UpdateNpcBotData(bot->GetEntry(), NPCBOT_UPDATE_ERASE);
+
+        handler->PSendSysMessage("{} dismissed and deleted. Gear returned.", name);
+        return true;
     }
 
     static bool HandleNpcBotAddCommand(ChatHandler* handler)

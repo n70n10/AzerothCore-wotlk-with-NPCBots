@@ -726,6 +726,9 @@ enum RBACPermissions
     RBAC_PERM_COMMAND_NPCBOT_COMMAND_MISC                    = 70035,
     RBAC_PERM_COMMAND_NPCBOT_CREATENEW                       = 70036,
     RBAC_PERM_COMMAND_NPCBOT_SEND                            = 70037,
+    RBAC_PERM_COMMAND_NPCBOT_HIRE                            = 70038,
+    RBAC_PERM_COMMAND_NPCBOT_HIRECLASS                       = 70039,
+    RBAC_PERM_COMMAND_NPCBOT_FIRE                            = 70040,
     //End NPCBot
     RBAC_PERM_MAX
 };

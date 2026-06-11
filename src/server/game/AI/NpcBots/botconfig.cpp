@@ -752,6 +752,11 @@ bool BotCfg::IsNpcBotModEnabled()
     return _enableNpcBots;
 }
 
+bool BotCfg::IsNpcBotPlayerHireEnabled()
+{
+    return sConfigMgr->GetOption<bool>("NpcBot.EnablePlayerHire", false);
+}
+
 bool BotCfg::IsNpcBotLogEnabled()
 {
     return _logToDB;
